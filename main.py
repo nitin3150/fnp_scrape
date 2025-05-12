@@ -1,115 +1,99 @@
-from get_urls import get_urls
-from playwright.async_api import async_playwright
-from utils.helper import clean_title, save_data_to_csv
 import asyncio
-import re
-import time
 import signal
 import sys
+import time
+import random
+from playwright.async_api import async_playwright
+from get_urls import get_urls
+from utils.helper import save_data_to_csv
+from services.get_title import get_title
+from services.get_price import get_price
+from services.get_cat import get_cat
 
-# Global store for scraped data
+# Global
 scraped_data = []
-
-# Max number of concurrent scrapes
 CONCURRENT_TASKS = 5
-
-# Semaphore to limit concurrency
+RESET_INTERVAL = 500  # Restart browser context every 500 URLs
 semaphore = asyncio.Semaphore(CONCURRENT_TASKS)
-
-async def scrape_product_data(context, url, max_retries=1):
-    retries = 0
-    while retries < max_retries:
-        try:
-            page = await context.new_page()
-
-            # Block images, fonts, and stylesheets
-            # await page.route("**/*", lambda route, request:
-            #     route.abort() if request.resource_type in ["image", "stylesheet", "font"] else route.continue_()
-            # )
-
-            await page.goto(url, timeout=10000)
-            await page.wait_for_load_state('domcontentloaded')
-
-            # Defaults
-            title = price = category = 'Error'
-
-            try:
-                title_text = await page.title()
-                title = clean_title(title_text) if title_text else 'N/A'
-            except:
-                title = 'Error'
-
-            try:
-                price_element = await page.query_selector('#odometer')
-                if price_element:
-                    price_text = await price_element.inner_text()
-                    price = int(re.sub(r"[^\d]", "", price_text))
-                else:
-                    price = 'N/A'
-            except Exception as e:
-                print(f"Price error: {e}")
-                price = 'Error'
-
-            try:
-                category_element = page.locator('a[itemprop="name"]').nth(1)
-                full_text = await category_element.inner_text(timeout=3000)
-                category = full_text.split("/")[0].strip()
-            except:
-                category = 'Error'
-
-            await page.close()
-            # print(f"Scraped: {url}")
-            return {'url': url, 'title': title, 'price': price, 'Category': category}
-
-            
-        except Exception as e:
-            retries += 1
-            if retries == max_retries:
-                return {'url': url, 'title': 'Error', 'price': 'Error', 'Category': 'Error'}
-            await asyncio.sleep(2)
 
 def handle_interrupt(signal_num, frame):
     print("\n❌ Interrupted! Saving scraped data...")
-    save_data_to_csv(scraped_data)
+    save_data_to_csv(scraped_data, "interrupted_checkpoint.csv")
     sys.exit(0)
 
-# Register interrupt signal handler
 signal.signal(signal.SIGINT, handle_interrupt)
 
-async def scrape_with_semaphore(context, url):
-    async with semaphore:
-        return await scrape_product_data(context, url)
+async def scrape_product_data(context, url, max_retries=2):
+    retries = 0
+    while retries < max_retries:
+        page = await context.new_page()
+        try:
+            await page.goto(url, timeout=10000)
+            await page.wait_for_load_state('domcontentloaded')
+
+            # Title
+            title = await get_title(page)
+            # Price
+            price = await get_price(page)
+            # Category
+            category = await get_cat(page)
+
+            # print(f"✅ Scraped: {url}")
+            return {'url': url, 'title': title, 'price': price, 'Category': category}
+
+        except Exception as e:
+            print(f"⚠️ Error scraping {url}: {e}")
+            retries += 1
+            await asyncio.sleep(2)
+            if retries == max_retries:
+                return {'url': url, 'title': 'Error', 'price': 'Error', 'Category': 'Error'}
+        finally:
+            await page.close()
+
+
+async def scrape_batch(playwright, urls_batch, batch_index):
+    browser = await playwright.chromium.launch(headless=True)
+    context = await browser.new_context()
+    batch_data = []
+
+    async def scrape_with_semaphore(url):
+        async with semaphore:
+            await asyncio.sleep(random.uniform(0.5, 2.0))  # Avoid detection
+            return await scrape_product_data(context, url)
+
+    tasks = [scrape_with_semaphore(url) for url in urls_batch]
+
+    for i, task in enumerate(asyncio.as_completed(tasks), start=1):
+        result = await task
+        scraped_data.append(result)
+        batch_data.append(result)
+
+        elapsed = time.time() - start_time
+        avg = elapsed / (batch_index * RESET_INTERVAL + i)
+        remaining = avg * (total_urls - (batch_index * RESET_INTERVAL + i))
+        print(f"[{batch_index * RESET_INTERVAL + i}/{total_urls}] ETA: {remaining/60:.1f} min")
+
+    await browser.close()
+    save_data_to_csv(batch_data, f"checkpoint_{batch_index * RESET_INTERVAL}.csv")
+
 
 async def main():
-    global scraped_data
+    global start_time, total_urls
     urls = get_urls()
-    total = len(urls)
+    total_urls = len(urls)
     start_time = time.time()
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
+    async with async_playwright() as playwright:
+        batches = [urls[i:i+RESET_INTERVAL] for i in range(0, total_urls, RESET_INTERVAL)]
 
-        tasks = [scrape_with_semaphore(context, url) for url in urls]
-
-        for i, future in enumerate(asyncio.as_completed(tasks)):
-            data = await future
-            scraped_data.append(data)
-
-            # Time & progress logging
-            elapsed = time.time() - start_time
-            avg_time_per_url = elapsed / (i + 1)
-            remaining = avg_time_per_url * (total - (i + 1))
-            print(f"[{i+1}/{total}] Elapsed: {elapsed/60:.1f} min | ETA: {remaining/60:.1f} min")
-
-            # Optional: Save every 1000 records as a backup
-            if (i + 1) % 1000 == 0:
-                save_data_to_csv(scraped_data, f"checkpoint_{i+1}.csv")
-
-        await browser.close()
+        for batch_index, batch_urls in enumerate(batches):
+            print(f"\n🚀 Starting batch {batch_index + 1}/{len(batches)}")
+            await scrape_batch(playwright, batch_urls, batch_index)
 
     # Final save
     save_data_to_csv(scraped_data, "products.csv")
+    print("✅ All done! Saved to products.csv")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
